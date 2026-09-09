@@ -1,6 +1,6 @@
 module github.com/bedirmirac/autotileSway
 
-go 1.26.7
+go 1.20.0
 
 require github.com/joshuarubin/go-sway v1.2.0
 
