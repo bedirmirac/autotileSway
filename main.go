@@ -7,11 +7,11 @@ import (
 	"os/exec"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/joshuarubin/go-sway"
 )
 
-// crash notifies the desktop environment and exits the program.
 func crash(err error) {
 	summary := "Sway Autotiling Crashed!"
 	body := "The autotiling daemon encountered an unexpected error."
@@ -19,8 +19,6 @@ func crash(err error) {
 		body = fmt.Sprintf("Error: %v", err)
 	}
 
-	// 1. Primary: Send desktop notification via D-Bus abstraction (notify-send)
-	// Works transparently across Wayland/X11 and all notification daemons (swaync, dunst, mako, etc.)
 	if notifyPath, lookupErr := exec.LookPath("notify-send"); lookupErr == nil {
 		cmd := exec.Command(
 			notifyPath,
@@ -31,7 +29,6 @@ func crash(err error) {
 		)
 		_ = cmd.Run()
 	} else {
-		// 2. Fallback: Spawn an available terminal emulator
 		terminals := []string{
 			os.Getenv("TERMINAL"),
 			"foot",
@@ -54,36 +51,77 @@ func crash(err error) {
 		}
 	}
 
-	// 3. Fallback: Always print to stderr for systemd/journald logs
 	fmt.Fprintf(os.Stderr, "[CRASH] %s: %s\n", summary, body)
 	os.Exit(1)
 }
 
 type eventHandler struct {
-	sway.EventHandler // dummy handler
-	client            sway.Client
+	sway.EventHandler
+	client sway.Client
 }
 
-func (h *eventHandler) Window(ctx context.Context, e sway.WindowEvent) {
-	if e.Change != "focus" {
+func (h *eventHandler) updateLayout(ctx context.Context, conID int64) {
+	// Sway'in ağacı güncellemesi ve yeni boyutları hesaplaması için mikro bekleme (race condition önleyici)
+	time.Sleep(20 * time.Millisecond)
+
+	tree, err := h.client.GetTree(ctx)
+	if err != nil {
 		return
 	}
 
-	if e.Container.Type == "floating_con" {
+	// Odaklı pencereyi ağaçtan taze koordinatlarıyla bul
+	focused := findFocused(tree)
+	if focused == nil {
 		return
 	}
 
-	width := e.Container.Rect.Width
-	height := e.Container.Rect.Height
+	// Yalnızca normal uygulama pencerelerini hedefle (floating, workspace veya output değil)
+	if focused.Type != "con" || focused.ID == 0 {
+		return
+	}
+
+	// Genişlik ve yükseklik kontrolü
+	width := focused.Rect.Width
+	height := focused.Rect.Height
+	if width == 0 || height == 0 {
+		return
+	}
 
 	var cmd string
 	if width > height {
-		cmd = "splith"
+		cmd = fmt.Sprintf("[con_id=%d] splith", focused.ID)
 	} else {
-		cmd = "splitv"
+		cmd = fmt.Sprintf("[con_id=%d] splitv", focused.ID)
 	}
 
-	h.client.RunCommand(ctx, cmd)
+	_, _ = h.client.RunCommand(ctx, cmd)
+}
+
+func findFocused(node *sway.Node) *sway.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Focused {
+		return node
+	}
+	for i := range node.Nodes {
+		if f := findFocused(node.Nodes[i]); f != nil {
+			return f
+		}
+	}
+	for i := range node.FloatingNodes {
+		if f := findFocused(node.FloatingNodes[i]); f != nil {
+			return f
+		}
+	}
+	return nil
+}
+
+func (h *eventHandler) Window(ctx context.Context, e sway.WindowEvent) {
+	// Bir pencere kapandığında ("close") veya yeni pencereye odak geçildiğinde ("focus")
+	if e.Change == "focus" || e.Change == "close" {
+		go h.updateLayout(ctx, e.Container.ID)
+	}
 }
 
 func main() {
